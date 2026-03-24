@@ -1,6 +1,8 @@
 // src/pages/PredictSolar.js
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import Navbar from '../components/Navbar';
+import * as XLSX from 'xlsx';
+import { saveAs } from 'file-saver';
 
 /* ── 誤差燈號組件 ── */
 const ErrorLight = ({ pct }) => {
@@ -58,6 +60,22 @@ const MODEL_COLORS = [
   { text: 'text-orange-400', bg: 'bg-orange-400/15', border: 'border-orange-400/30', dot: 'bg-orange-400' },
 ];
 
+/* ── 排序方向圖示 ── */
+const SortIcon = ({ direction }) => {
+  if (!direction) return <span className="text-white/15 text-[8px] ml-0.5">⇅</span>;
+  return <span className="text-primary text-[9px] ml-0.5 font-bold">{direction === 'asc' ? '↑' : '↓'}</span>;
+};
+
+/* ── 取得燈號顏色 hex ── */
+const getErrorColor = (pct) => {
+  if (pct === null || pct === undefined) return null;
+  const v = Number(pct);
+  if (isNaN(v)) return null;
+  if (v <= 5) return { bg: 'C6EFCE', fg: '006100' };   // 綠
+  if (v <= 15) return { bg: 'FFEB9C', fg: '9C6500' };  // 黃
+  return { bg: 'FFC7CE', fg: '9C0006' };                // 紅
+};
+
 export default function PredictSolar({ onBack, onNavigateToDashboard, onLogout, onNavigateToSites, onNavigateToTrain, onNavigateToPredict, onNavigateToModelMgmt }) {
   const [file, setFile] = useState(null);
   const [selectedModelIds, setSelectedModelIds] = useState([]);
@@ -78,6 +96,13 @@ export default function PredictSolar({ onBack, onNavigateToDashboard, onLogout, 
   // pagination
   const PAGE_SIZE = 20;
   const [page, setPage] = useState(0);
+
+  // sorting state: { key: string, direction: 'asc' | 'desc' | null }
+  const [sortConfig, setSortConfig] = useState({ key: null, direction: null });
+
+  // filter state: { [colName]: { operator: '>' | '<' | '=' | '>=' | '<=' | 'contains', value: string } }
+  const [filters, setFilters] = useState({});
+  const [showFilters, setShowFilters] = useState(false);
 
   // Fetch trained models on mount
   useEffect(() => {
@@ -111,11 +136,12 @@ export default function PredictSolar({ onBack, onNavigateToDashboard, onLogout, 
     setIsPredicting(true);
     setError('');
     setResult(null);
+    setSortConfig({ key: null, direction: null });
+    setFilters({});
     try {
       const formData = new FormData();
       formData.append('file', file);
 
-      // 單模型走原本 API，多模型走新 API
       if (selectedModelIds.length === 1) {
         formData.append('model_id', selectedModelIds[0]);
         const res = await fetch('http://127.0.0.1:8000/train/predict-file', {
@@ -124,7 +150,6 @@ export default function PredictSolar({ onBack, onNavigateToDashboard, onLogout, 
         });
         const json = await res.json();
         if (!res.ok) throw new Error(json?.detail || '預測失敗');
-        // 轉換為統一的多模型格式
         setResult({
           mode: 'single',
           models_summary: [{
@@ -158,27 +183,242 @@ export default function PredictSolar({ onBack, onNavigateToDashboard, onLogout, 
 
   const navProps = { onNavigateToDashboard, onNavigateToTrain, onNavigateToPredict, onNavigateToSites, onNavigateToModelMgmt, onLogout };
 
-  // Pagination helpers
-  const rows = result?.rows || [];
-  const totalPages = Math.ceil(rows.length / PAGE_SIZE);
-  const pagedRows = rows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
   const displayCols = result ? result.columns : [];
 
-  // Build color map for selected models (for multi-model mode)
+  // Detect which columns are prediction/error columns
+  const isPredCol = (col) => col.startsWith('pred_') || col === 'predicted_EAC';
+  const isErrCol = (col) => col.startsWith('err_') || col === 'error_pct';
+
+  // Determine if a column is numeric based on first few non-null values
+  const isNumericCol = useCallback((col) => {
+    if (!result?.rows) return false;
+    for (const row of result.rows.slice(0, 20)) {
+      const v = row[col];
+      if (v !== null && v !== undefined && v !== '' && v !== '—') {
+        return typeof v === 'number' || (!isNaN(Number(v)) && v !== '');
+      }
+    }
+    return false;
+  }, [result]);
+
+  // Get model info from column name like "pred_XGBoost_5"
+  const getModelIdFromCol = (col) => {
+    const parts = col.split('_');
+    return parts.length >= 3 ? parseInt(parts[parts.length - 1]) : null;
+  };
+
+  // Build color map for selected models
   const okModels = (result?.models_summary || []).filter(m => m.status === 'ok');
   const modelColorMap = {};
   okModels.forEach((m, i) => {
     modelColorMap[m.model_id] = MODEL_COLORS[i % MODEL_COLORS.length];
   });
 
-  // Detect which columns are prediction/error columns
-  const isPredCol = (col) => col.startsWith('pred_') || col === 'predicted_EAC';
-  const isErrCol = (col) => col.startsWith('err_') || col === 'error_pct';
+  // ── Filtering logic ──
+  const filteredRows = useMemo(() => {
+    if (!result?.rows) return [];
+    const allRows = result.rows;
+    const activeFilters = Object.entries(filters).filter(([, f]) => f.value !== '' && f.value !== undefined);
+    if (activeFilters.length === 0) return allRows;
 
-  // Get model info from column name like "pred_XGBoost_5"
-  const getModelIdFromCol = (col) => {
-    const parts = col.split('_');
-    return parts.length >= 3 ? parseInt(parts[parts.length - 1]) : null;
+    return allRows.filter(row => {
+      return activeFilters.every(([col, filter]) => {
+        const cellVal = row[col];
+        if (cellVal === null || cellVal === undefined) return false;
+
+        if (filter.operator === 'contains') {
+          return String(cellVal).toLowerCase().includes(String(filter.value).toLowerCase());
+        }
+
+        const numVal = Number(cellVal);
+        const filterNum = Number(filter.value);
+        if (isNaN(numVal) || isNaN(filterNum)) return false;
+
+        switch (filter.operator) {
+          case '>':  return numVal > filterNum;
+          case '<':  return numVal < filterNum;
+          case '=':  return Math.abs(numVal - filterNum) < 0.0001;
+          case '>=': return numVal >= filterNum;
+          case '<=': return numVal <= filterNum;
+          default:   return true;
+        }
+      });
+    });
+  }, [result, filters]);
+
+  // ── Sorting logic ──
+  const sortedRows = useMemo(() => {
+    if (!sortConfig.key || !sortConfig.direction) return filteredRows;
+
+    return [...filteredRows].sort((a, b) => {
+      const aVal = a[sortConfig.key];
+      const bVal = b[sortConfig.key];
+
+      // Handle nulls: push to end
+      if (aVal === null || aVal === undefined) return 1;
+      if (bVal === null || bVal === undefined) return -1;
+
+      const aNum = Number(aVal);
+      const bNum = Number(bVal);
+
+      let comparison = 0;
+      if (!isNaN(aNum) && !isNaN(bNum)) {
+        comparison = aNum - bNum;
+      } else {
+        comparison = String(aVal).localeCompare(String(bVal), 'zh-Hant');
+      }
+
+      return sortConfig.direction === 'asc' ? comparison : -comparison;
+    });
+  }, [filteredRows, sortConfig]);
+
+  // ── Pagination on sorted+filtered data ──
+  const totalPages = Math.ceil(sortedRows.length / PAGE_SIZE);
+  const pagedRows = sortedRows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  // ── Sort handler ──
+  const handleSort = (colKey) => {
+    setSortConfig(prev => {
+      if (prev.key !== colKey) return { key: colKey, direction: 'asc' };
+      if (prev.direction === 'asc') return { key: colKey, direction: 'desc' };
+      return { key: null, direction: null };
+    });
+    setPage(0);
+  };
+
+  // ── Filter handler ──
+  const updateFilter = (col, field, value) => {
+    setFilters(prev => ({
+      ...prev,
+      [col]: { ...prev[col], [field]: value },
+    }));
+    setPage(0);
+  };
+
+  const clearAllFilters = () => {
+    setFilters({});
+    setPage(0);
+  };
+
+  const hasActiveFilters = Object.values(filters).some(f => f.value !== '' && f.value !== undefined);
+
+  // ── Clean column label ──
+  const getColLabel = (col) => {
+    if (col === 'predicted_EAC') return '預測 EAC';
+    if (col === 'error_pct') return '誤差%';
+    if (col.startsWith('pred_')) {
+      const parts = col.replace('pred_', '').split('_');
+      return `預測 ${parts.slice(0, -1).join('_')}`;
+    }
+    if (col.startsWith('err_')) {
+      const parts = col.replace('err_', '').split('_');
+      return `誤差% ${parts.slice(0, -1).join('_')}`;
+    }
+    return col;
+  };
+
+  // ── XLSX Download ──
+  const handleDownloadXlsx = () => {
+    if (!result) return;
+    const dataToExport = sortedRows;
+
+    // Build header row: # + displayCols + (single mode: 燈號)
+    const headerLabels = ['#', ...displayCols.map(getColLabel)];
+    if (result.mode === 'single') headerLabels.push('燈號');
+
+    // Build data rows
+    const wsData = [headerLabels];
+    dataToExport.forEach((row, idx) => {
+      const rowArr = [idx + 1];
+      displayCols.forEach(col => {
+        const val = row[col];
+        rowArr.push(val === null || val === undefined ? '' : val);
+      });
+      if (result.mode === 'single') {
+        const ep = row.error_pct;
+        if (ep !== null && ep !== undefined) {
+          const v = Number(ep);
+          rowArr.push(v <= 5 ? '正常' : v <= 15 ? '留意' : '異常');
+        } else {
+          rowArr.push('');
+        }
+      }
+      wsData.push(rowArr);
+    });
+
+    // Create worksheet
+    const ws = XLSX.utils.aoa_to_sheet(wsData);
+
+    // Apply styles to error columns (cell background colors)
+    // Find which column indices are error columns
+    const errColIndices = [];
+    displayCols.forEach((col, ci) => {
+      if (isErrCol(col)) {
+        errColIndices.push(ci + 1); // +1 because col 0 is '#'
+      }
+    });
+
+    // Also check single mode 燈號 column
+    const lightColIdx = result.mode === 'single' ? headerLabels.length - 1 : -1;
+
+    // Apply cell styles for each data row
+    for (let r = 1; r < wsData.length; r++) {
+      // Style error percentage columns
+      errColIndices.forEach(c => {
+        const cellAddr = XLSX.utils.encode_cell({ r, c });
+        const cellVal = wsData[r][c];
+        const colorInfo = getErrorColor(cellVal);
+        if (colorInfo && ws[cellAddr]) {
+          ws[cellAddr].s = {
+            fill: { fgColor: { rgb: colorInfo.bg } },
+            font: { color: { rgb: colorInfo.fg }, bold: true },
+          };
+        }
+      });
+
+      // Style 燈號 column for single mode
+      if (lightColIdx >= 0) {
+        const cellAddr = XLSX.utils.encode_cell({ r, c: lightColIdx });
+        const errPctColIdx = displayCols.indexOf('error_pct');
+        const errVal = errPctColIdx >= 0 ? wsData[r][errPctColIdx + 1] : null;
+        const colorInfo = getErrorColor(errVal);
+        if (colorInfo && ws[cellAddr]) {
+          ws[cellAddr].s = {
+            fill: { fgColor: { rgb: colorInfo.bg } },
+            font: { color: { rgb: colorInfo.fg }, bold: true },
+            alignment: { horizontal: 'center' },
+          };
+        }
+      }
+    }
+
+    // Style header row
+    for (let c = 0; c < headerLabels.length; c++) {
+      const cellAddr = XLSX.utils.encode_cell({ r: 0, c });
+      if (ws[cellAddr]) {
+        ws[cellAddr].s = {
+          fill: { fgColor: { rgb: '1F2937' } },
+          font: { color: { rgb: 'FFFFFF' }, bold: true },
+          alignment: { horizontal: 'center' },
+        };
+      }
+    }
+
+    // Set column widths
+    ws['!cols'] = headerLabels.map((h, i) => ({
+      wch: i === 0 ? 5 : Math.max(h.length * 2.5, 12),
+    }));
+
+    // Create workbook and save
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, '預測結果');
+
+    const now = new Date();
+    const ts = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+    const filename = `prediction_result_${ts}.xlsx`;
+
+    const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array', cellStyles: true });
+    saveAs(new Blob([wbout], { type: 'application/octet-stream' }), filename);
   };
 
   return (
@@ -323,109 +563,205 @@ export default function PredictSolar({ onBack, onNavigateToDashboard, onLogout, 
           <div className={`flex-1 w-full rounded-2xl border border-white/10 bg-white/[0.01] p-6 flex flex-col relative transition-all shadow-2xl ${!result && 'items-center justify-center border-dashed opacity-40 min-h-[500px]'}`}>
             {result ? (
               <div className="w-full flex flex-col animate-fade-in">
-                {/* Header */}
-                <div className="flex justify-between items-center mb-4">
+                {/* Header with actions */}
+                <div className="flex flex-wrap justify-between items-center mb-4 gap-3">
                   <h2 className="text-sm font-bold text-white flex items-center gap-2">
                     <span className="material-symbols-outlined !text-base text-primary">table_chart</span>
-                    預測結果 <span className="text-white/30 font-normal ml-2">共 {result.total_rows} 筆</span>
+                    預測結果
+                    <span className="text-white/30 font-normal ml-2">
+                      {hasActiveFilters
+                        ? `篩選後 ${sortedRows.length} / 共 ${result.total_rows} 筆`
+                        : `共 ${result.total_rows} 筆`
+                      }
+                    </span>
                   </h2>
-                  {/* Model legend for multi-mode */}
-                  {okModels.length > 1 && (
-                    <div className="flex items-center gap-3">
-                      {okModels.map((m, i) => {
-                        const c = MODEL_COLORS[i % MODEL_COLORS.length];
-                        return (
-                          <span key={m.model_id} className="flex items-center gap-1.5">
-                            <span className={`size-2 rounded-full ${c.dot}`} />
-                            <span className={`text-[10px] font-bold ${c.text}`}>{m.model_type}#{m.model_id}</span>
-                          </span>
-                        );
-                      })}
-                    </div>
-                  )}
-                  {okModels.length === 1 && (
-                    <div className="text-[10px] text-white/30">
-                      模型：<span className="text-primary font-bold">{okModels[0].model_type}</span>
-                    </div>
-                  )}
+
+                  <div className="flex items-center gap-2">
+                    {/* Model legend for multi-mode */}
+                    {okModels.length > 1 && (
+                      <div className="flex items-center gap-3 mr-2">
+                        {okModels.map((m, i) => {
+                          const c = MODEL_COLORS[i % MODEL_COLORS.length];
+                          return (
+                            <span key={m.model_id} className="flex items-center gap-1.5">
+                              <span className={`size-2 rounded-full ${c.dot}`} />
+                              <span className={`text-[10px] font-bold ${c.text}`}>{m.model_type}#{m.model_id}</span>
+                            </span>
+                          );
+                        })}
+                      </div>
+                    )}
+                    {okModels.length === 1 && (
+                      <div className="text-[10px] text-white/30 mr-2">
+                        模型：<span className="text-primary font-bold">{okModels[0].model_type}</span>
+                      </div>
+                    )}
+
+                    {/* Toggle filter button */}
+                    <button
+                      onClick={() => setShowFilters(f => !f)}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-bold border transition-all ${
+                        showFilters
+                          ? 'bg-primary/10 border-primary/30 text-primary'
+                          : 'border-white/10 text-white/40 hover:bg-white/5 hover:text-white/60'
+                      }`}
+                    >
+                      <span className="material-symbols-outlined !text-sm">filter_alt</span>
+                      篩選
+                      {hasActiveFilters && (
+                        <span className="size-4 rounded-full bg-primary text-background-dark text-[8px] font-black flex items-center justify-center">
+                          {Object.values(filters).filter(f => f.value).length}
+                        </span>
+                      )}
+                    </button>
+
+                    {/* Clear filters */}
+                    {hasActiveFilters && (
+                      <button
+                        onClick={clearAllFilters}
+                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[10px] font-bold border border-red-500/20 text-red-400 hover:bg-red-500/10 transition-all"
+                      >
+                        <span className="material-symbols-outlined !text-sm">close</span>
+                        清除
+                      </button>
+                    )}
+
+                    {/* Download XLSX button */}
+                    <button
+                      onClick={handleDownloadXlsx}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-bold border border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/10 transition-all"
+                    >
+                      <span className="material-symbols-outlined !text-sm">download</span>
+                      下載 XLSX
+                    </button>
+                  </div>
                 </div>
 
                 {/* Table */}
                 <div className="overflow-x-auto rounded-xl border border-white/5">
                   <table className="w-full text-[10px] text-left whitespace-nowrap">
                     <thead className="bg-white/5 text-white/40 uppercase sticky top-0 z-10">
+                      {/* Column headers with sort */}
                       <tr>
                         <th className="px-3 py-2.5 font-bold">#</th>
                         {displayCols.map(col => {
                           const mid = getModelIdFromCol(col);
                           const c = mid !== null && modelColorMap[mid] ? modelColorMap[mid] : null;
                           const isHighlight = isPredCol(col) || isErrCol(col) || col === 'EAC';
-                          // Clean column label
-                          let label = col;
-                          if (col === 'predicted_EAC') label = '預測 EAC';
-                          else if (col === 'error_pct') label = '誤差%';
-                          else if (col.startsWith('pred_')) {
-                            const parts = col.replace('pred_', '').split('_');
-                            label = `預測 ${parts.slice(0, -1).join('_')}`;
-                          } else if (col.startsWith('err_')) {
-                            const parts = col.replace('err_', '').split('_');
-                            label = `誤差% ${parts.slice(0, -1).join('_')}`;
-                          }
+                          const label = getColLabel(col);
+                          const isSorted = sortConfig.key === col;
                           return (
-                            <th key={col} className={`px-3 py-2.5 font-bold ${isHighlight ? (c ? c.text : 'text-primary') : ''}`}>
-                              {label}
+                            <th
+                              key={col}
+                              className={`px-3 py-2.5 font-bold cursor-pointer select-none hover:text-white/60 transition-colors ${isHighlight ? (c ? c.text : 'text-primary') : ''}`}
+                              onClick={() => handleSort(col)}
+                            >
+                              <span className="inline-flex items-center gap-0.5">
+                                {label}
+                                <SortIcon direction={isSorted ? sortConfig.direction : null} />
+                              </span>
                             </th>
                           );
                         })}
-                        {/* 單模型時顯示燈號欄 */}
-                        {result.mode === 'single' && <th className="px-3 py-2.5 font-bold text-primary">燈號</th>}
+
                       </tr>
+
+                      {/* Filter row */}
+                      {showFilters && (
+                        <tr className="bg-white/[0.03] border-t border-white/5">
+                          <td className="px-2 py-1.5"></td>
+                          {displayCols.map(col => {
+                            const numeric = isNumericCol(col);
+                            const filterVal = filters[col]?.value || '';
+                            const filterOp = filters[col]?.operator || (numeric ? '>' : 'contains');
+                            return (
+                              <td key={col} className="px-1.5 py-1.5">
+                                <div className="flex items-center gap-0.5">
+                                  {numeric ? (
+                                    <>
+                                      <select
+                                        value={filterOp}
+                                        onChange={(e) => updateFilter(col, 'operator', e.target.value)}
+                                        className="bg-white/5 border border-white/10 rounded text-[9px] text-white/60 px-1 py-0.5 w-10 focus:border-primary/50 focus:outline-none"
+                                      >
+                                        <option value=">">&gt;</option>
+                                        <option value="<">&lt;</option>
+                                        <option value="=">=</option>
+                                        <option value=">=">&gt;=</option>
+                                        <option value="<=">&lt;=</option>
+                                      </select>
+                                      <input
+                                        type="text"
+                                        value={filterVal}
+                                        onChange={(e) => updateFilter(col, 'value', e.target.value)}
+                                        placeholder="值"
+                                        className="bg-white/5 border border-white/10 rounded text-[9px] text-white/70 px-1.5 py-0.5 w-16 placeholder:text-white/15 focus:border-primary/50 focus:outline-none font-mono"
+                                      />
+                                    </>
+                                  ) : (
+                                    <input
+                                      type="text"
+                                      value={filterVal}
+                                      onChange={(e) => {
+                                        updateFilter(col, 'operator', 'contains');
+                                        updateFilter(col, 'value', e.target.value);
+                                      }}
+                                      placeholder="搜尋..."
+                                      className="bg-white/5 border border-white/10 rounded text-[9px] text-white/70 px-1.5 py-0.5 w-full placeholder:text-white/15 focus:border-primary/50 focus:outline-none"
+                                    />
+                                  )}
+                                </div>
+                              </td>
+                            );
+                          })}
+
+                        </tr>
+                      )}
                     </thead>
                     <tbody className="divide-y divide-white/5 font-mono text-white/70">
-                      {pagedRows.map((row, idx) => {
-                        const globalIdx = page * PAGE_SIZE + idx;
-                        // For single mode, use original error_pct for row coloring
-                        const singleErrPct = result.mode === 'single' ? row.error_pct : null;
-                        const rowBg = singleErrPct !== null && singleErrPct !== undefined
-                          ? (singleErrPct > 15 ? 'bg-red-500/[0.03]' : singleErrPct > 5 ? 'bg-yellow-500/[0.02]' : '')
-                          : '';
-                        return (
-                          <tr key={globalIdx} className={`hover:bg-white/[0.03] transition-colors ${rowBg}`}>
-                            <td className="px-3 py-2 text-white/20">{globalIdx + 1}</td>
-                            {displayCols.map(col => {
-                              const val = row[col];
-                              const mid = getModelIdFromCol(col);
-                              const c = mid !== null && modelColorMap[mid] ? modelColorMap[mid] : null;
+                      {pagedRows.length === 0 ? (
+                        <tr>
+                          <td colSpan={displayCols.length + 2} className="px-4 py-8 text-center text-white/20 text-xs">
+                            {hasActiveFilters ? '沒有符合篩選條件的資料' : '無資料'}
+                          </td>
+                        </tr>
+                      ) : (
+                        pagedRows.map((row, idx) => {
+                          const globalIdx = page * PAGE_SIZE + idx;
+                          const singleErrPct = result.mode === 'single' ? row.error_pct : null;
+                          const rowBg = singleErrPct !== null && singleErrPct !== undefined
+                            ? (singleErrPct > 15 ? 'bg-red-500/[0.03]' : singleErrPct > 5 ? 'bg-yellow-500/[0.02]' : '')
+                            : '';
+                          return (
+                            <tr key={globalIdx} className={`hover:bg-white/[0.03] transition-colors ${rowBg}`}>
+                              <td className="px-3 py-2 text-white/20">{globalIdx + 1}</td>
+                              {displayCols.map(col => {
+                                const val = row[col];
+                                const mid = getModelIdFromCol(col);
+                                const c = mid !== null && modelColorMap[mid] ? modelColorMap[mid] : null;
 
-                              let cellClass = 'px-3 py-2';
-                              if (isPredCol(col)) cellClass += ` font-bold ${c ? c.text : 'text-primary'}`;
-                              else if (col === 'EAC') cellClass += ' text-blue-400';
-                              else if (isErrCol(col)) {
-                                // Show as error light in multi mode
-                                if (result.mode === 'multi') {
+                                let cellClass = 'px-3 py-2';
+                                if (isPredCol(col)) cellClass += ` font-bold ${c ? c.text : 'text-primary'}`;
+                                else if (col === 'EAC') cellClass += ' text-blue-400';
+                                else if (isErrCol(col)) {
                                   return (
                                     <td key={col} className="px-3 py-2">
                                       <ErrorLight pct={val} />
                                     </td>
                                   );
                                 }
-                                cellClass += ' hidden'; // single mode: hidden, shown in light column
-                              }
 
-                              return (
-                                <td key={col} className={cellClass}>
-                                  {val === null || val === undefined ? '—' : typeof val === 'number' ? Number(val).toFixed(4) : String(val)}
-                                </td>
-                              );
-                            })}
-                            {result.mode === 'single' && (
-                              <td className="px-3 py-2">
-                                <ErrorLight pct={row.error_pct} />
-                              </td>
-                            )}
-                          </tr>
-                        );
-                      })}
+                                return (
+                                  <td key={col} className={cellClass}>
+                                    {val === null || val === undefined ? '—' : typeof val === 'number' ? Number(val).toFixed(4) : String(val)}
+                                  </td>
+                                );
+                              })}
+
+                            </tr>
+                          );
+                        })
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -433,7 +769,7 @@ export default function PredictSolar({ onBack, onNavigateToDashboard, onLogout, 
                 {/* Pagination */}
                 {totalPages > 1 && (
                   <div className="flex items-center justify-between mt-4 text-[10px] text-white/40">
-                    <span>顯示 {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, rows.length)} / {rows.length}</span>
+                    <span>顯示 {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, sortedRows.length)} / {sortedRows.length}{hasActiveFilters ? ` (篩選自 ${result.total_rows} 筆)` : ''}</span>
                     <div className="flex gap-1">
                       <button
                         onClick={() => setPage(p => Math.max(0, p - 1))}

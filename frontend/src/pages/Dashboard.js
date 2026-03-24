@@ -114,6 +114,7 @@ export default function Dashboard({
             status: '已建立',
             usage: item.usage_count ?? 0,
             acc: item.parameters?.r2 ?? '—',
+            fileName: item.file_name || '未知檔案',
             dataId: item.data_id,
             filePath: item.file_path,
             parameters: item.parameters || {},
@@ -209,10 +210,10 @@ export default function Dashboard({
                         </div>
 
                         <p className="text-xs text-white/30 mt-1 font-mono">
-                          ID: {model.id} | 訓練日期: {model.date}
+                          訓練日期: {model.date}
                         </p>
                         <p className="text-xs text-white/20 mt-1">
-                          類型: {model.type} | data_id: {model.dataId}
+                          類型: {model.type} | 使用資料：{model.fileName}
                         </p>
                       </div>
 
