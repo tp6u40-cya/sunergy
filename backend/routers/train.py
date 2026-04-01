@@ -16,7 +16,7 @@ from models import AfterData, TrainedModel, Site, SiteData
 from schemas import TrainRequest
 from routers.train_utils import (
     TW_TIMEZONE,
-    HAS_SKLEARN, HAS_XGBOOST, HAS_OPTUNA, HAS_TORCH,
+    HAS_SKLEARN, HAS_XGBOOST, HAS_OPTUNA,
     _processed_data_dir, _models_dir, _list_artifacts,
     _load_cleaned_csv, _to_native,
     _ensure_time_features, _validate_clean_data,
@@ -34,10 +34,7 @@ if HAS_XGBOOST:
     import xgboost as xgb
 if HAS_OPTUNA:
     import optuna
-if HAS_TORCH:
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import DataLoader, TensorDataset
+
 
 router = APIRouter(prefix="/train", tags=["Train"])
 
@@ -52,7 +49,6 @@ def debug_modules():
         "HAS_SKLEARN": HAS_SKLEARN,
         "HAS_XGBOOST": HAS_XGBOOST,
         "HAS_OPTUNA": HAS_OPTUNA,
-        "HAS_TORCH": HAS_TORCH,
     }
 
 
@@ -225,8 +221,8 @@ def _train_single_model(model_id: str, X_train, y_train, X_test, y_test, strateg
         raise HTTPException(status_code=500, detail="scikit-learn not available on server")
     if model_id == "XGBoost" and not HAS_XGBOOST:
         raise HTTPException(status_code=500, detail="xgboost not available on server")
-    if model_id == "LSTM" and not HAS_TORCH:
-        raise HTTPException(status_code=500, detail="PyTorch not available on server for LSTM")
+    if model_id == "LSTM":
+        raise HTTPException(status_code=400, detail="LSTM model has been removed from this system")
 
     best = None
     tried = []
@@ -331,102 +327,16 @@ def _train_single_model(model_id: str, X_train, y_train, X_test, y_test, strateg
                 if 'reg_alpha' in p:
                     xgb_kwargs['reg_alpha'] = float(p.get('reg_alpha'))
                 return xgb.XGBRegressor(**xgb_kwargs)
-            if mid == "LSTM":
-                return {"model_type": "LSTM", "params": p}
             raise ValueError(f"unsupported model '{mid}' for bayes")
-
-        def train_lstm_bayes(params, X_tr, y_tr, X_te, y_te):
-            """Train LSTM for Bayesian optimization and return WMAPE"""
-            if not HAS_TORCH:
-                raise HTTPException(status_code=500, detail="PyTorch not available for LSTM")
-
-            lookback = int(params.get("lookback", 24))
-            hidden_size = int(params.get("hidden_size", 64))
-            num_layers = int(params.get("num_layers", 1))
-            dropout = float(params.get("dropout", 0.0))
-            lr = float(params.get("lr", 1e-3))
-            epochs = int(params.get("epochs", 20))
-            batch_size = int(params.get("batch_size", 64))
-
-            m = X_tr.mean(axis=0)
-            s = X_tr.std(axis=0)
-            s[s == 0] = 1.0
-            Xtr_scaled = ((X_tr - m) / s).astype(np.float32)
-            Xte_scaled = ((X_te - m) / s).astype(np.float32)
-
-            def make_seq(X, y, win):
-                if len(X) <= win:
-                    return None, None
-                Xs, ys = [], []
-                for i in range(win, len(X)):
-                    Xs.append(X[i-win:i])
-                    ys.append(y[i])
-                return np.array(Xs, dtype=np.float32), np.array(ys, dtype=np.float32)
-
-            Xtr_seq, ytr_seq = make_seq(Xtr_scaled, y_tr, lookback)
-            Xte_seq, yte_seq = make_seq(Xte_scaled, y_te, lookback)
-            if Xtr_seq is None or Xte_seq is None:
-                return float('inf'), {}, np.array([])
-
-            class LSTMRegressor(nn.Module):
-                def __init__(self, input_size, hidden_size, num_layers, dropout):
-                    super().__init__()
-                    self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
-                    self.fc = nn.Linear(hidden_size, 1)
-                def forward(self, x):
-                    out, _ = self.lstm(x)
-                    out = out[:, -1, :]
-                    out = self.fc(out)
-                    return out.squeeze(-1)
-
-            if device_pref == "cuda":
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            elif device_pref == "cpu":
-                device = torch.device("cpu")
-            else:
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            model = LSTMRegressor(input_size=Xtr_seq.shape[-1], hidden_size=hidden_size, num_layers=num_layers, dropout=dropout).to(device)
-            opt = torch.optim.Adam(model.parameters(), lr=lr)
-            loss_fn = nn.MSELoss()
-            ds = TensorDataset(torch.from_numpy(Xtr_seq), torch.from_numpy(ytr_seq))
-            dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
-
-            model.train()
-            for _ in range(epochs):
-                for xb, yb in dl:
-                    xb = xb.to(device)
-                    yb = yb.to(device)
-                    opt.zero_grad()
-                    pred = model(xb)
-                    loss = loss_fn(pred, yb)
-                    loss.backward()
-                    opt.step()
-
-            model.eval()
-            with torch.no_grad():
-                y_pred = model(torch.from_numpy(Xte_seq).to(device)).cpu().numpy()
-
-            eps = 1e-6
-            wmape = float(np.sum(np.abs(yte_seq - y_pred)) / (np.sum(np.abs(yte_seq)) + eps))
-            r2 = float(r2_score(yte_seq, y_pred))
-            rmse = float(np.sqrt(mean_squared_error(yte_seq, y_pred)))
-            mae = float(mean_absolute_error(yte_seq, y_pred))
-
-            return wmape, {"r2": r2, "rmse": rmse, "mae": mae, "wmape": wmape}, y_pred
 
         def objective(trial):
             p = suggest_from_spec(trial, param_spec or {})
-
-            if model_id == "LSTM":
-                wmape, _, _ = train_lstm_bayes(p, X_train, y_train, X_test, y_test)
-                return wmape
-            else:
-                model = build_model(model_id, p)
-                model.fit(X_train, y_train)
-                y_pred = model.predict(X_test)
-                eps = 1e-6
-                wmape = float(np.sum(np.abs(y_test - y_pred)) / (np.sum(np.abs(y_test)) + eps))
-                return wmape
+            model = build_model(model_id, p)
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            eps = 1e-6
+            wmape = float(np.sum(np.abs(y_test - y_pred)) / (np.sum(np.abs(y_test)) + eps))
+            return wmape
 
         trials = int((param_spec or {}).get('_trials', 30))
         study = optuna.create_study(direction="minimize")
@@ -434,19 +344,15 @@ def _train_single_model(model_id: str, X_train, y_train, X_test, y_test, strateg
         best_p = study.best_params
 
         # evaluate metrics for best params
-        if model_id == "LSTM":
-            _, metrics, _ = train_lstm_bayes(best_p, X_train, y_train, X_test, y_test)
-            return {"best": {"params": best_p, **metrics}, "trials": []}
-        else:
-            model = build_model(model_id, best_p)
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
-            r2 = float(r2_score(y_test, y_pred))
-            rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
-            mae = float(mean_absolute_error(y_test, y_pred))
-            eps = 1e-6
-            wmape = float(np.sum(np.abs(y_test - y_pred)) / (np.sum(np.abs(y_test)) + eps))
-            return {"best": {"params": best_p, "r2": r2, "rmse": rmse, "mae": mae, "wmape": wmape}, "trials": []}
+        model = build_model(model_id, best_p)
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        r2 = float(r2_score(y_test, y_pred))
+        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+        mae = float(mean_absolute_error(y_test, y_pred))
+        eps = 1e-6
+        wmape = float(np.sum(np.abs(y_test - y_pred)) / (np.sum(np.abs(y_test)) + eps))
+        return {"best": {"params": best_p, "r2": r2, "rmse": rmse, "mae": mae, "wmape": wmape}, "trials": []}
 
     candidates = [{}]
     if strategy == "grid":
@@ -500,78 +406,8 @@ def _train_single_model(model_id: str, X_train, y_train, X_test, y_test, strateg
             if 'reg_alpha' in params:
                 xgb_kwargs['reg_alpha'] = float(params.get('reg_alpha'))
             model = xgb.XGBRegressor(**xgb_kwargs)
-        elif model_id == "LSTM":
-            lookback = int(params.get("lookback", 24))
-            hidden_size = int(params.get("hidden_size", 64))
-            num_layers = int(params.get("num_layers", 1))
-            dropout = float(params.get("dropout", 0.0))
-            lr = float(params.get("lr", 1e-3))
-            epochs = int(params.get("epochs", 20))
-            batch_size = int(params.get("batch_size", 64))
-
-            def make_seq(X, y, win):
-                if len(X) <= win:
-                    raise HTTPException(status_code=400, detail=f"LSTM lookback {win} too large for dataset")
-                Xs, ys = [], []
-                for i in range(win, len(X)):
-                    Xs.append(X[i-win:i])
-                    ys.append(y[i])
-                return np.array(Xs, dtype=np.float32), np.array(ys, dtype=np.float32)
-
-            m = X_train.mean(axis=0)
-            s = X_train.std(axis=0)
-            s[s == 0] = 1.0
-            Xtr = ((X_train - m) / s).astype(np.float32)
-            Xte = ((X_test - m) / s).astype(np.float32)
-            Xtr_seq, ytr_seq = make_seq(Xtr, y_train, lookback)
-            Xte_seq, yte_seq = make_seq(Xte, y_test, lookback)
-
-            class LSTMRegressor(nn.Module):
-                def __init__(self, input_size, hidden_size, num_layers, dropout):
-                    super().__init__()
-                    self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
-                    self.fc = nn.Linear(hidden_size, 1)
-                def forward(self, x):
-                    out, _ = self.lstm(x)
-                    out = out[:, -1, :]
-                    out = self.fc(out)
-                    return out.squeeze(-1)
-
-            if device_pref == "cuda":
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            elif device_pref == "cpu":
-                device = torch.device("cpu")
-            else:
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            model = LSTMRegressor(input_size=Xtr_seq.shape[-1], hidden_size=hidden_size, num_layers=num_layers, dropout=dropout).to(device)
-            opt = torch.optim.Adam(model.parameters(), lr=lr)
-            loss_fn = nn.MSELoss()
-            ds = TensorDataset(torch.from_numpy(Xtr_seq), torch.from_numpy(ytr_seq))
-            dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
-            model.train()
-            for _ in range(epochs):
-                for xb, yb in dl:
-                    xb = xb.to(device)
-                    yb = yb.to(device)
-                    opt.zero_grad()
-                    pred = model(xb)
-                    loss = loss_fn(pred, yb)
-                    loss.backward()
-                    opt.step()
-
-            model.eval()
-            with torch.no_grad():
-                y_pred = model(torch.from_numpy(Xte_seq).to(device)).cpu().numpy()
-            r2 = float(r2_score(yte_seq, y_pred))
-            rmse = float(np.sqrt(mean_squared_error(yte_seq, y_pred)))
-            mae = float(mean_absolute_error(yte_seq, y_pred))
-            eps = 1e-6
-            wmape = float(np.sum(np.abs(yte_seq - y_pred)) / (np.sum(np.abs(yte_seq)) + eps))
-            metrics = {"r2": r2, "rmse": rmse, "mae": mae, "wmape": wmape}
-            tried.append({"params": params, **metrics})
-            if (best is None) or (metrics["wmape"] < best["wmape"]):
-                best = {"params": params, **metrics}
-            continue
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported model: {model_id}")
 
         # For SVR, RandomForest, XGBoost: use generic evaluate function
         metrics = evaluate(model)
@@ -751,71 +587,6 @@ def run_training(payload: TrainRequest, db: Session = Depends(get_db)):
                         model.fit(X_train, y_train)
                         path = models_dir / f"{timestamp}_{mid}.joblib"
                         _joblib.dump(model, path)
-                    elif mid == 'LSTM' and HAS_TORCH:
-                        best_params = res.get('best_params', {}) or {}
-                        lookback = int(best_params.get('lookback', 24))
-                        hidden_size = int(best_params.get('hidden_size', 64))
-                        num_layers = int(best_params.get('num_layers', 1))
-                        dropout = float(best_params.get('dropout', 0.0))
-                        lr = float(best_params.get('lr', 1e-3))
-                        epochs = int(best_params.get('epochs', 20))
-                        batch_size = int(best_params.get('batch_size', 64))
-
-                        m = X_train.mean(axis=0)
-                        s = X_train.std(axis=0)
-                        s[s == 0] = 1.0
-
-                        def make_seq(X, y, win):
-                            if len(X) <= win:
-                                raise HTTPException(status_code=400, detail=f"LSTM lookback {win} too large for dataset")
-                            Xs, ys = [], []
-                            for i in range(win, len(X)):
-                                Xs.append(X[i-win:i])
-                                ys.append(y[i])
-                            return np.array(Xs, dtype=np.float32), np.array(ys, dtype=np.float32)
-
-                        Xtr = ((X_train - m) / s).astype(np.float32)
-                        Xtr_seq, ytr_seq = make_seq(Xtr, y_train, lookback)
-
-                        class LSTMRegressor(nn.Module):
-                            def __init__(self, input_size, hidden_size, num_layers, dropout):
-                                super().__init__()
-                                self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
-                                self.fc = nn.Linear(hidden_size, 1)
-                            def forward(self, x):
-                                out, _ = self.lstm(x)
-                                out = out[:, -1, :]
-                                out = self.fc(out)
-                                return out.squeeze(-1)
-
-                        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                        lstm_model = LSTMRegressor(input_size=Xtr_seq.shape[-1], hidden_size=hidden_size, num_layers=num_layers, dropout=dropout).to(device)
-                        opt = torch.optim.Adam(lstm_model.parameters(), lr=lr)
-                        loss_fn = nn.MSELoss()
-                        ds = TensorDataset(torch.from_numpy(Xtr_seq), torch.from_numpy(ytr_seq))
-                        dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
-                        lstm_model.train()
-                        for _ in range(epochs):
-                            for xb, yb in dl:
-                                xb = xb.to(device)
-                                yb = yb.to(device)
-                                opt.zero_grad()
-                                pred = lstm_model(xb)
-                                loss = loss_fn(pred, yb)
-                                loss.backward()
-                                opt.step()
-
-                        path = models_dir / f"{timestamp}_{mid}.pt"
-                        torch.save({
-                            'model_state_dict': lstm_model.state_dict(),
-                            'input_size': Xtr_seq.shape[-1],
-                            'hidden_size': hidden_size,
-                            'num_layers': num_layers,
-                            'dropout': dropout,
-                            'lookback': lookback,
-                            'scaler_mean': m.tolist(),
-                            'scaler_std': s.tolist(),
-                        }, str(path))
                     else:
                         continue
                 # write sidecar metadata

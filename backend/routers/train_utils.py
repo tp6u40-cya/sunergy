@@ -18,7 +18,6 @@ TW_TIMEZONE = timezone(timedelta(hours=8))
 HAS_SKLEARN = False
 HAS_XGBOOST = False
 HAS_OPTUNA = False
-HAS_TORCH = False
 
 try:
     from sklearn.model_selection import train_test_split, ParameterGrid
@@ -43,14 +42,6 @@ try:
     HAS_OPTUNA = True
 except Exception:
     HAS_OPTUNA = False
-
-try:
-    import torch  # type: ignore
-    import torch.nn as nn  # type: ignore
-    from torch.utils.data import DataLoader, TensorDataset  # type: ignore
-    HAS_TORCH = True
-except Exception:
-    HAS_TORCH = False
 
 
 # ───────────────────────────────────────

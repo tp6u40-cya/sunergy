@@ -58,7 +58,7 @@ export default function UserGuide({ onFinish }) {
       id: 3,
       icon: 'model_training', 
       title: 'Step 3: 進行模型訓練', // 已更新
-      desc: '選擇最適合的演算法（如 LSTM、XGBoost），讓機器學習自動尋找數據特徵並完成模型開發。',
+      desc: '選擇最適合的演算法（如 XGBoost、SVR、RandomForest），讓機器學習自動尋找數據特徵並完成模型開發。',
       screenContent: (
         <div className="flex h-full flex-col items-center justify-center bg-[#1E1E1E]">
            <div className="flex gap-4 mb-4">

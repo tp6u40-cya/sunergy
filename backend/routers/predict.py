@@ -11,16 +11,13 @@ from database import get_db
 from models import AfterData, TrainedModel
 from schemas import PredictRequest
 from routers.train_utils import (
-    HAS_SKLEARN, HAS_XGBOOST, HAS_TORCH,
+    HAS_SKLEARN, HAS_XGBOOST,
     _models_dir, _load_cleaned_csv, _to_native, _ensure_time_features,
 )
 
 # conditional imports (already guarded by HAS_* flags)
 if HAS_XGBOOST:
     import xgboost as xgb
-if HAS_TORCH:
-    import torch
-    import torch.nn as nn
 
 router = APIRouter(prefix="/train", tags=["Predict"])
 
@@ -81,53 +78,7 @@ def predict(payload: PredictRequest, db: Session = Depends(get_db)):
         booster.load_model(str(artifact_path))
         y_pred = booster.predict(X)
     elif artifact_path.suffix == ".pt":
-        # LSTM model prediction
-        if not HAS_TORCH:
-            raise HTTPException(status_code=500, detail="PyTorch not available to load LSTM model")
-
-        checkpoint = torch.load(str(artifact_path), map_location='cpu')
-        input_size = checkpoint['input_size']
-        hidden_size = checkpoint['hidden_size']
-        num_layers = checkpoint['num_layers']
-        dropout = checkpoint['dropout']
-        lookback = checkpoint['lookback']
-        scaler_mean = np.array(checkpoint['scaler_mean'])
-        scaler_std = np.array(checkpoint['scaler_std'])
-
-        class LSTMRegressor(nn.Module):
-            def __init__(self, input_size, hidden_size, num_layers, dropout):
-                super().__init__()
-                self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
-                self.fc = nn.Linear(hidden_size, 1)
-            def forward(self, x):
-                out, _ = self.lstm(x)
-                out = out[:, -1, :]
-                out = self.fc(out)
-                return out.squeeze(-1)
-
-        model = LSTMRegressor(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, dropout=dropout)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-
-        # Standardize input
-        X_scaled = ((X - scaler_mean) / scaler_std).astype(np.float32)
-
-        # Build sequences
-        if len(X_scaled) <= lookback:
-            raise HTTPException(status_code=400, detail=f"Not enough data for LSTM prediction (need > {lookback} rows)")
-
-        X_seq = []
-        for i in range(lookback, len(X_scaled)):
-            X_seq.append(X_scaled[i-lookback:i])
-        X_seq = np.array(X_seq, dtype=np.float32)
-
-        with torch.no_grad():
-            y_pred = model(torch.from_numpy(X_seq)).numpy()
-
-        # Pad the beginning with NaN since LSTM needs lookback window
-        y_pred_full = np.full(len(X), np.nan)
-        y_pred_full[lookback:] = y_pred
-        y_pred = y_pred_full
+        raise HTTPException(status_code=400, detail="LSTM models (.pt) are no longer supported")
     else:
         # joblib models (RF/SVR or XGB fallback)
         import joblib as _joblib
@@ -236,40 +187,7 @@ async def predict_file(
         booster.load_model(str(artifact_path))
         y_pred = booster.predict(X)
     elif artifact_path.suffix == ".pt":
-        if not HAS_TORCH:
-            raise HTTPException(status_code=500, detail="PyTorch not available")
-        checkpoint = torch.load(str(artifact_path), map_location="cpu")
-        input_size = checkpoint["input_size"]
-        hidden_size = checkpoint["hidden_size"]
-        num_layers = checkpoint["num_layers"]
-        dropout = checkpoint["dropout"]
-        lookback = checkpoint["lookback"]
-        scaler_mean = np.array(checkpoint["scaler_mean"])
-        scaler_std = np.array(checkpoint["scaler_std"])
-
-        class LSTMRegressor(nn.Module):
-            def __init__(self, input_size, hidden_size, num_layers, dropout):
-                super().__init__()
-                self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
-                                   batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
-                self.fc = nn.Linear(hidden_size, 1)
-            def forward(self, x):
-                out, _ = self.lstm(x)
-                return self.fc(out[:, -1, :]).squeeze(-1)
-
-        model = LSTMRegressor(input_size, hidden_size, num_layers, dropout)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        model.eval()
-        X_scaled = ((X - scaler_mean) / scaler_std).astype(np.float32)
-        if len(X_scaled) <= lookback:
-            raise HTTPException(status_code=400,
-                                detail=f"Not enough rows for LSTM (need > {lookback})")
-        X_seq = np.array([X_scaled[i - lookback:i] for i in range(lookback, len(X_scaled))],
-                         dtype=np.float32)
-        with torch.no_grad():
-            preds = model(torch.from_numpy(X_seq)).numpy()
-        y_pred = np.full(len(X), np.nan)
-        y_pred[lookback:] = preds
+        raise HTTPException(status_code=400, detail="LSTM models (.pt) are no longer supported")
     else:
         import joblib as _joblib
         model = _joblib.load(artifact_path)
@@ -330,40 +248,7 @@ def _predict_with_model(artifact_path: Path, meta: dict, X: np.ndarray):
         return booster.predict(X)
 
     elif artifact_path.suffix == ".pt":
-        if not HAS_TORCH:
-            raise HTTPException(status_code=500, detail="PyTorch not available")
-        checkpoint = torch.load(str(artifact_path), map_location="cpu")
-        input_size = checkpoint["input_size"]
-        hidden_size = checkpoint["hidden_size"]
-        num_layers = checkpoint["num_layers"]
-        dropout = checkpoint["dropout"]
-        lookback = checkpoint["lookback"]
-        scaler_mean = np.array(checkpoint["scaler_mean"])
-        scaler_std = np.array(checkpoint["scaler_std"])
-
-        class LSTMRegressor(nn.Module):
-            def __init__(self, input_size, hidden_size, num_layers, dropout):
-                super().__init__()
-                self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
-                                   batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
-                self.fc = nn.Linear(hidden_size, 1)
-            def forward(self, x):
-                out, _ = self.lstm(x)
-                return self.fc(out[:, -1, :]).squeeze(-1)
-
-        model = LSTMRegressor(input_size, hidden_size, num_layers, dropout)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        model.eval()
-        X_scaled = ((X - scaler_mean) / scaler_std).astype(np.float32)
-        if len(X_scaled) <= lookback:
-            raise HTTPException(status_code=400, detail=f"Not enough rows for LSTM (need > {lookback})")
-        X_seq = np.array([X_scaled[i - lookback:i] for i in range(lookback, len(X_scaled))],
-                         dtype=np.float32)
-        with torch.no_grad():
-            preds = model(torch.from_numpy(X_seq)).numpy()
-        y_pred = np.full(len(X), np.nan)
-        y_pred[lookback:] = preds
-        return y_pred
+        raise HTTPException(status_code=400, detail="LSTM models (.pt) are no longer supported")
 
     else:
         import joblib as _joblib

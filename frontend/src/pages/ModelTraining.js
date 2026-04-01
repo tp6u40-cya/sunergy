@@ -53,15 +53,6 @@ export default function ModelTraining({ onBack, onNext, onNavigateToDashboard, o
   const [splitRatio, setSplitRatio] = useState(80);
   const [selectedModels, setSelectedModels] = useState(['XGBoost']);
   const [paramIntervals, setParamIntervals] = useState({
-    // LSTM basic params
-    LSTM_epochs_s: 10, LSTM_epochs_e: 60,
-    LSTM_lookback_s: 12, LSTM_lookback_e: 72,
-    LSTM_hidden_s: 32, LSTM_hidden_e: 128,
-    // LSTM advanced params
-    LSTM_num_layers_s: 1, LSTM_num_layers_e: 3,
-    LSTM_dropout_s: 0.0, LSTM_dropout_e: 0.5,
-    LSTM_lr_s: 0.0001, LSTM_lr_e: 0.01,
-    LSTM_batch_size_s: 32, LSTM_batch_size_e: 128,
     // XGBoost
     XGB_trees_s: 100, XGB_trees_e: 500,
     XGB_depth_s: 3, XGB_depth_e: 10,
@@ -80,10 +71,9 @@ export default function ModelTraining({ onBack, onNext, onNavigateToDashboard, o
     RF_trees_s: 50, RF_trees_e: 300,
     RF_depth_s: 3, RF_depth_e: 12,
   });
-  // Cap for XGB / LSTM grid combinations
+  // Cap for XGB grid combinations
   const [xgbMaxComb, setXgbMaxComb] = useState(100);
-  const [lstmMaxComb, setLstmMaxComb] = useState(50);
-  const [activeChartLines, setActiveChartLines] = useState({ LSTM: true, XGBoost: true, SVR: true, RandomForest: true });
+  const [activeChartLines, setActiveChartLines] = useState({ XGBoost: true, SVR: true, RandomForest: true });
   const [isTraining, setIsTraining] = useState(false);
   const [isTrained, setIsTrained] = useState(false);
   const [trainingResults, setTrainingResults] = useState({});
@@ -94,7 +84,7 @@ export default function ModelTraining({ onBack, onNext, onNavigateToDashboard, o
   // Training progress state
   const [trainingProgress, setTrainingProgress] = useState(0);
   const [trainingStatus, setTrainingStatus] = useState('');
-  const [showAdvancedLSTM, setShowAdvancedLSTM] = useState(false);
+
 
   const toggleModel = (id) => setSelectedModels(prev => prev.includes(id) ? prev.filter(m => m !== id) : [...prev, id]);
 
@@ -147,18 +137,7 @@ export default function ModelTraining({ onBack, onNext, onNavigateToDashboard, o
         gamma: { values: ['scale', 'auto'] },
       };
     }
-    if (selectedModels.includes('LSTM')) {
-      params['LSTM'] = {
-        lookback: { start: paramIntervals.LSTM_lookback_s, end: paramIntervals.LSTM_lookback_e, step: 12 },
-        hidden_size: { start: paramIntervals.LSTM_hidden_s, end: paramIntervals.LSTM_hidden_e, step: 32 },
-        epochs: { start: paramIntervals.LSTM_epochs_s, end: paramIntervals.LSTM_epochs_e, step: 10 },
-        num_layers: { start: paramIntervals.LSTM_num_layers_s, end: paramIntervals.LSTM_num_layers_e, step: 1 },
-        dropout: { start: paramIntervals.LSTM_dropout_s, end: paramIntervals.LSTM_dropout_e, step: 0.1 },
-        lr: { start: paramIntervals.LSTM_lr_s, end: paramIntervals.LSTM_lr_e, step: 0.001 },
-        batch_size: { start: paramIntervals.LSTM_batch_size_s, end: paramIntervals.LSTM_batch_size_e, step: 32 },
-        _max_combinations: Number(lstmMaxComb)
-      };
-    }
+
 
     // Add _trials parameter for Bayesian optimization strategy
     if (strategy === 'bayes') {
@@ -302,7 +281,7 @@ export default function ModelTraining({ onBack, onNext, onNavigateToDashboard, o
               <span className="size-5 rounded-full bg-primary text-background-dark flex items-center justify-center text-[10px]">2</span> 選擇模型
             </h2>
             <div className="grid grid-cols-2 gap-2">
-              {['LSTM', 'XGBoost', 'SVR', 'RandomForest'].map(m => (
+              {['XGBoost', 'SVR', 'RandomForest'].map(m => (
                 <button key={m} onClick={() => toggleModel(m)} className={`p-2 rounded-lg border text-[10px] font-bold transition-all ${selectedModels.includes(m) ? 'border-primary bg-primary/10 text-primary' : 'border-white/10 bg-white/5 text-white/40'}`}>{m}</button>
               ))}
             </div>
@@ -329,47 +308,12 @@ export default function ModelTraining({ onBack, onNext, onNavigateToDashboard, o
                 </div>
               )}
             </div>
-            {/* 運算裝置選擇 (僅 LSTM) */}
-            {selectedModels.includes('LSTM') && (
-              <div className="mb-4 flex items-center gap-2 text-[10px]">
-                <span className="text-white/50">運算裝置</span>
-                {[{ id: 'auto', label: 'AUTO' }, { id: 'cpu', label: 'CPU' }, { id: 'cuda', label: 'GPU' }].map(({ id, label }) => (
-                  <label key={id} className={["px-2", "py-1", "rounded", "border", "cursor-pointer", (device === id ? "border-primary text-primary" : "border-white/10 text-white/50")].join(' ')}>
-                    <input type="radio" name="device" value={id} checked={device === id} onChange={() => setDevice(id)} className="hidden" />
-                    {label}
-                  </label>
-                ))}
-              </div>
-            )}
+
             <div className="flex flex-col gap-4">
               {selectedModels.map(id => (
                 <div key={id} className="p-4 bg-black/20 rounded-xl border border-white/5">
                   <p className="text-[10px] font-bold text-white/60 mb-6 uppercase tracking-tighter border-b border-white/5 pb-1">{id} 模型參數設定</p>
-                  {id === 'LSTM' && (
-                    <>
-                      <IntervalSlider label="Epochs" min={1} max={300} start={paramIntervals.LSTM_epochs_s} end={paramIntervals.LSTM_epochs_e} onStartChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_epochs_s: v })} onEndChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_epochs_e: v })} />
-                      <IntervalSlider label="Lookback" min={4} max={168} start={paramIntervals.LSTM_lookback_s} end={paramIntervals.LSTM_lookback_e} onStartChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_lookback_s: v })} onEndChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_lookback_e: v })} />
-                      <IntervalSlider label="Hidden Size" min={16} max={256} start={paramIntervals.LSTM_hidden_s} end={paramIntervals.LSTM_hidden_e} onStartChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_hidden_s: v })} onEndChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_hidden_e: v })} />
 
-                      {/* Advanced LSTM parameters toggle */}
-                      <button
-                        onClick={() => setShowAdvancedLSTM(!showAdvancedLSTM)}
-                        className="mt-2 text-[10px] text-primary/70 hover:text-primary transition-colors flex items-center gap-1"
-                      >
-                        <span>{showAdvancedLSTM ? '▼' : '▶'}</span>
-                        {showAdvancedLSTM ? '隱藏進階參數' : '顯示進階參數'}
-                      </button>
-
-                      {showAdvancedLSTM && (
-                        <div className="mt-3 pt-3 border-t border-white/5">
-                          <IntervalSlider label="Num Layers" min={1} max={4} step={1} start={paramIntervals.LSTM_num_layers_s} end={paramIntervals.LSTM_num_layers_e} onStartChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_num_layers_s: v })} onEndChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_num_layers_e: v })} />
-                          <IntervalSlider label="Dropout" min={0} max={0.7} step={0.05} start={paramIntervals.LSTM_dropout_s} end={paramIntervals.LSTM_dropout_e} onStartChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_dropout_s: v })} onEndChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_dropout_e: v })} />
-                          <IntervalSlider label="Learning Rate" min={0.0001} max={0.02} step={0.0005} start={paramIntervals.LSTM_lr_s} end={paramIntervals.LSTM_lr_e} onStartChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_lr_s: v })} onEndChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_lr_e: v })} />
-                          <IntervalSlider label="Batch Size" min={16} max={256} step={16} start={paramIntervals.LSTM_batch_size_s} end={paramIntervals.LSTM_batch_size_e} onStartChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_batch_size_s: v })} onEndChange={(v) => setParamIntervals({ ...paramIntervals, LSTM_batch_size_e: v })} />
-                        </div>
-                      )}
-                    </>
-                  )}
                   {id === 'XGBoost' && (
                     <>
                       <IntervalSlider label="n_estimators" min={10} max={2000} start={paramIntervals.XGB_trees_s} end={paramIntervals.XGB_trees_e} onStartChange={(v) => setParamIntervals({ ...paramIntervals, XGB_trees_s: v })} onEndChange={(v) => setParamIntervals({ ...paramIntervals, XGB_trees_e: v })} />
